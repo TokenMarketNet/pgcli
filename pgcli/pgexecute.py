@@ -1,3 +1,4 @@
+import re
 import traceback
 import logging
 import psycopg2
@@ -28,6 +29,8 @@ ext.register_type(ext.new_type((17,), 'BYTEA_TEXT', psycopg2.STRING))
 
 # TODO: Get default timeout from pgclirc?
 _WAIT_SELECT_TIMEOUT = 1
+
+_TRANSACTIONLESS = re.compile('^\s*transactionless\s+', re.I)
 
 
 def _wait_select(conn):
@@ -170,6 +173,7 @@ class PGExecute(object):
         self.port = port
         self.dsn = dsn
         self.extra_args = {k: unicode2utf8(v) for k, v in kwargs.items()}
+        self.current_savepoint_number = 1
         self.connect()
 
     def connect(self, database=None, user=None, password=None, host=None,
@@ -199,11 +203,13 @@ class PGExecute(object):
 
             cursor = conn.cursor()
 
+        conn.autocommit = False
         conn.set_client_encoding('utf8')
         if hasattr(self, 'conn'):
             self.conn.close()
+
+        cursor.execute('ROLLBACK')
         self.conn = conn
-        self.conn.autocommit = True
 
         if dsn:
             # When we connect using a DSN, we don't really know what db,
@@ -321,6 +327,7 @@ class PGExecute(object):
                 _logger.error("sql: %r, error: %r", sql, e)
                 _logger.error("traceback: %r", traceback.format_exc())
 
+                print('error here')
                 if (self._must_raise(e)
                         or not exception_formatter):
                     raise
@@ -329,6 +336,9 @@ class PGExecute(object):
 
                 if not on_error_resume:
                     break
+            except Exception as e:
+                traceback.print_exc()
+                raise
 
     def _must_raise(self, e):
         """Return true if e is an error that should not be caught in ``run``.
@@ -352,9 +362,41 @@ class PGExecute(object):
         """Returns tuple (title, rows, headers, status)"""
         _logger.debug('Regular sql statement. sql: %r', split_sql)
         cur = self.conn.cursor()
-        cur.execute(split_sql)
 
-        # conn.notices persist between queies, we use pop to clear out the list
+        m = _TRANSACTIONLESS.match(split_sql)
+        transactionless = bool(m)
+        has_transaction = self.valid_transaction()
+        if m:
+            if has_transaction:
+                raise psycopg2.ProgrammingError(
+                    'A transaction is on; transactionless commands cannot be'
+                    ' executed until the transaction is committed or rolled'
+                    ' back')
+
+            transactionless = True
+            split_sql = split_sql[m.end():]
+
+        if not transactionless:
+            if not has_transaction:
+                cur.execute('BEGIN')
+
+            savepoint_name = 'pgcli_savepoint_{:08x}'.format(
+                self.current_savepoint_number)
+
+            cur.execute('SAVEPOINT {}'.format(savepoint_name))
+
+        try:
+            cur.execute(split_sql)
+        except BaseException as e:
+            if not transactionless:
+                cur.execute('ROLLBACK TO {}'.format(savepoint_name))
+
+            raise
+
+        self.current_savepoint_number += 1
+
+        # conn.notices persist between queries,
+        # we use pop to clear out the list
         title = ''
         while len(self.conn.notices) > 0:
             title = utf8tounicode(self.conn.notices.pop()) + title
